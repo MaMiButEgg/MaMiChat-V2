@@ -1,0 +1,439 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>mamichat</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js";
+  import {
+    getFirestore, collection, doc, setDoc, getDoc, updateDoc,
+    arrayUnion, onSnapshot, addDoc, query, orderBy, serverTimestamp
+  } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js";
+
+  /* =========================================================
+     BURAYI DOLDUR — Firebase Console > Project settings > Your apps
+     ========================================================= */
+  const firebaseConfig = {
+    apiKey: "AIzaSyCxXN9TYHC9sNpD6Qj1rmlvSA1DVssr7xQ",
+    authDomain: "mamichatv2.firebaseapp.com",
+    projectId: "mamichatv2",
+    storageBucket: "mamichatv2.firebasestorage.app",
+    messagingSenderId: "814980978657",
+    appId: "1:814980978657:web:d86c50ccab2627f66be4a0"
+  };
+  /* ========================================================= */
+
+  const app = initializeApp(firebaseConfig);
+  const db = getFirestore(app);
+
+  // ---------- yardımcılar ----------
+  const $ = (sel) => document.querySelector(sel);
+  const norm = (s) => s.trim().toLowerCase();
+  const convId = (a, b) => [norm(a), norm(b)].sort().join("__");
+
+  async function sha256(text) {
+    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+    return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  function fmtTime(ts) {
+    if (!ts) return "--:--:--";
+    const d = ts.toDate ? ts.toDate() : new Date();
+    return d.toLocaleTimeString("tr-TR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  }
+
+  // ---------- state ----------
+  let me = null;           // giriş yapan kullanıcı adı (orijinal biçim)
+  let activePartner = null;
+  let unsubMessages = null;
+  let unsubContacts = null;
+
+  // ---------- ekran geçişleri ----------
+  function showScreen(id) {
+    document.querySelectorAll(".screen").forEach(s => s.classList.remove("active"));
+    $(id).classList.add("active");
+  }
+
+  function setAuthMsg(text, isError = true) {
+    const el = $("#auth-msg");
+    el.textContent = text;
+    el.style.color = isError ? "var(--danger)" : "var(--ok)";
+  }
+
+  // ---------- kayıt / giriş ----------
+  async function register() {
+    const name = $("#reg-name").value.trim();
+    const pass = $("#reg-pass").value;
+    if (!name || !pass) return setAuthMsg("kullanıcı adı ve şifre boş olamaz.");
+    if (name.includes("__") || name.includes("/")) return setAuthMsg("kullanıcı adı '__' veya '/' içeremez.");
+
+    const ref = doc(db, "users", norm(name));
+    const snap = await getDoc(ref);
+    if (snap.exists()) return setAuthMsg("bu kullanıcı adı zaten alınmış.");
+
+    const passHash = await sha256(pass);
+    await setDoc(ref, { displayName: name, passHash, createdAt: serverTimestamp() });
+    await setDoc(doc(db, "contacts", norm(name)), { list: [] });
+    setAuthMsg("kayıt tamam. şimdi giriş yapabilirsin.", false);
+    $("#reg-name").value = ""; $("#reg-pass").value = "";
+  }
+
+  async function login() {
+    const name = $("#login-name").value.trim();
+    const pass = $("#login-pass").value;
+    if (!name || !pass) return setAuthMsg("kullanıcı adı ve şifre boş olamaz.");
+
+    const ref = doc(db, "users", norm(name));
+    const snap = await getDoc(ref);
+    if (!snap.exists()) return setAuthMsg("böyle bir kullanıcı yok.");
+
+    const passHash = await sha256(pass);
+    if (snap.data().passHash !== passHash) return setAuthMsg("şifre yanlış.");
+
+    me = snap.data().displayName;
+    enterChat();
+  }
+
+  function logout() {
+    me = null; activePartner = null;
+    if (unsubMessages) unsubMessages();
+    if (unsubContacts) unsubContacts();
+    $("#login-name").value = ""; $("#login-pass").value = "";
+    setAuthMsg("", false);
+    showScreen("#screen-auth");
+  }
+
+  // ---------- sohbet ----------
+  function enterChat() {
+    $("#me-label").textContent = me;
+    showScreen("#screen-chat");
+    listenContacts();
+  }
+
+  function listenContacts() {
+    if (unsubContacts) unsubContacts();
+    unsubContacts = onSnapshot(doc(db, "contacts", norm(me)), (snap) => {
+      const list = snap.exists() ? (snap.data().list || []) : [];
+      renderContacts(list);
+    });
+  }
+
+  function renderContacts(list) {
+    const box = $("#contact-list");
+    box.innerHTML = "";
+    if (list.length === 0) {
+      box.innerHTML = `<div class="empty-hint">henüz kimseyle konuşmadın.<br>yukarıdan bir kullanıcı adı yaz.</div>`;
+      return;
+    }
+    list.forEach(name => {
+      const item = document.createElement("div");
+      item.className = "contact" + (activePartner && norm(activePartner) === norm(name) ? " active" : "");
+      item.textContent = name;
+      item.onclick = () => openChat(name);
+      box.appendChild(item);
+    });
+  }
+
+  async function addContactBothSides(a, b) {
+    const refA = doc(db, "contacts", norm(a));
+    const refB = doc(db, "contacts", norm(b));
+    const snapA = await getDoc(refA);
+    if (!snapA.exists()) await setDoc(refA, { list: [] });
+    const snapB = await getDoc(refB);
+    if (!snapB.exists()) await setDoc(refB, { list: [] });
+    await updateDoc(refA, { list: arrayUnion(b) });
+    await updateDoc(refB, { list: arrayUnion(a) });
+  }
+
+  async function startChat() {
+    const target = $("#new-contact").value.trim();
+    if (!target) return;
+    if (norm(target) === norm(me)) { setChatMsg("kendinle sohbet açamazsın."); return; }
+
+    const ref = doc(db, "users", norm(target));
+    const snap = await getDoc(ref);
+    if (!snap.exists()) { setChatMsg(`"${target}" adında kayıtlı kullanıcı yok.`); return; }
+
+    const realName = snap.data().displayName;
+    await addContactBothSides(me, realName);
+    $("#new-contact").value = "";
+    setChatMsg("");
+    openChat(realName);
+  }
+
+  function setChatMsg(text) {
+    $("#chat-side-msg").textContent = text;
+  }
+
+  function openChat(partner) {
+    activePartner = partner;
+    $("#chat-partner").textContent = partner;
+    $("#message-input").disabled = false;
+    $("#send-btn").disabled = false;
+    $("#messages").innerHTML = "";
+    listenContacts(); // refresh highlight
+
+    if (unsubMessages) unsubMessages();
+    const id = convId(me, partner);
+    const q = query(collection(db, "chats", id, "messages"), orderBy("createdAt", "asc"));
+    unsubMessages = onSnapshot(q, (snap) => {
+      $("#messages").innerHTML = "";
+      snap.forEach(d => renderMessage(d.data()));
+      $("#messages").scrollTop = $("#messages").scrollHeight;
+    });
+  }
+
+  function renderMessage(msg) {
+    const row = document.createElement("div");
+    const mine = norm(msg.sender) === norm(me);
+    row.className = "msg" + (mine ? " mine" : "");
+    row.innerHTML = `<span class="msg-time">[${fmtTime(msg.createdAt)}]</span> <span class="msg-sender">${msg.sender}:</span> <span class="msg-text"></span>`;
+    row.querySelector(".msg-text").textContent = msg.text;
+    $("#messages").appendChild(row);
+  }
+
+  async function sendMessage() {
+    const input = $("#message-input");
+    const text = input.value.trim();
+    if (!text || !activePartner) return;
+    input.value = "";
+    const id = convId(me, activePartner);
+    await addDoc(collection(db, "chats", id, "messages"), {
+      sender: me, text, createdAt: serverTimestamp()
+    });
+  }
+
+  // ---------- olaylar ----------
+  window.addEventListener("DOMContentLoaded", () => {
+    $("#tab-login").onclick = () => { $("#pane-login").classList.add("active"); $("#pane-register").classList.remove("active"); $("#tab-login").classList.add("active"); $("#tab-register").classList.remove("active"); setAuthMsg("", false); };
+    $("#tab-register").onclick = () => { $("#pane-register").classList.add("active"); $("#pane-login").classList.remove("active"); $("#tab-register").classList.add("active"); $("#tab-login").classList.remove("active"); setAuthMsg("", false); };
+
+    $("#login-btn").onclick = login;
+    $("#register-btn").onclick = register;
+    $("#logout-btn").onclick = logout;
+    $("#start-chat-btn").onclick = startChat;
+    $("#send-btn").onclick = sendMessage;
+
+    $("#login-pass").addEventListener("keydown", e => { if (e.key === "Enter") login(); });
+    $("#reg-pass").addEventListener("keydown", e => { if (e.key === "Enter") register(); });
+    $("#new-contact").addEventListener("keydown", e => { if (e.key === "Enter") startChat(); });
+    $("#message-input").addEventListener("keydown", e => { if (e.key === "Enter") sendMessage(); });
+  });
+</script>
+<style>
+  :root {
+    --bg: #14171c;
+    --panel: #1a1e25;
+    --panel-2: #1f242c;
+    --border: #2a2f38;
+    --text: #d8dee9;
+    --text-dim: #6b7280;
+    --accent: #e8a33d;
+    --ok: #7fb069;
+    --danger: #e0645a;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    height: 100%; margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 14px;
+  }
+  .screen { display: none; height: 100%; }
+  .screen.active { display: flex; }
+
+  /* ---------- AUTH SCREEN ---------- */
+  #screen-auth {
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    gap: 24px;
+  }
+  .logo {
+    font-size: 22px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+  }
+  .logo::after {
+    content: "█";
+    color: var(--accent);
+    animation: blink 1s steps(1) infinite;
+    margin-left: 2px;
+  }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .auth-card {
+    width: 320px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 20px;
+  }
+  .tabs { display: flex; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
+  .tab {
+    flex: 1; text-align: center; padding: 8px 0;
+    color: var(--text-dim); cursor: pointer;
+    border-bottom: 2px solid transparent;
+  }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .pane { display: none; flex-direction: column; gap: 10px; }
+  .pane.active { display: flex; }
+
+  label { color: var(--text-dim); font-size: 12px; }
+  input[type=text], input[type=password] {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 14px;
+    padding: 8px 10px;
+    border-radius: 4px;
+    outline: none;
+  }
+  input[type=text]:focus, input[type=password]:focus { border-color: var(--accent); }
+
+  button {
+    font-family: inherit;
+    font-size: 13px;
+    cursor: pointer;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    background: var(--panel-2);
+    color: var(--text);
+    padding: 8px 12px;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: 0.4; cursor: default; }
+  button:disabled:hover { border-color: var(--border); color: var(--text); }
+  .primary-btn { background: var(--accent); color: #1a1206; border-color: var(--accent); font-weight: 600; }
+  .primary-btn:hover { opacity: 0.9; color: #1a1206; }
+
+  #auth-msg { min-height: 16px; font-size: 12px; }
+
+  /* ---------- CHAT SCREEN ---------- */
+  #screen-chat { flex-direction: column; }
+  .chat-header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .chat-header .logo { font-size: 15px; }
+  #me-label { color: var(--accent); }
+
+  .chat-body { flex: 1; display: flex; min-height: 0; }
+
+  .sidebar {
+    width: 220px;
+    border-right: 1px solid var(--border);
+    background: var(--panel);
+    display: flex; flex-direction: column;
+    padding: 12px;
+    gap: 8px;
+  }
+  .sidebar-row { display: flex; gap: 6px; }
+  .sidebar-row input { flex: 1; }
+  #chat-side-msg { font-size: 11px; color: var(--danger); min-height: 14px; }
+  #contact-list { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; margin-top: 6px; }
+  .contact {
+    padding: 8px; border-radius: 4px; cursor: pointer;
+    color: var(--text-dim); border: 1px solid transparent;
+  }
+  .contact:hover { color: var(--text); }
+  .contact.active { color: var(--accent); border-color: var(--border); background: var(--panel-2); }
+  .empty-hint { color: var(--text-dim); font-size: 12px; line-height: 1.6; padding: 8px 4px; }
+
+  .chat-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .chat-main-header {
+    padding: 10px 16px; border-bottom: 1px solid var(--border);
+    color: var(--text-dim); font-size: 13px;
+  }
+  .chat-main-header span { color: var(--accent); }
+
+  #messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 6px; }
+  .msg { font-size: 13px; line-height: 1.5; word-break: break-word; }
+  .msg-time { color: var(--text-dim); }
+  .msg-sender { color: var(--text-dim); }
+  .msg.mine .msg-sender { color: var(--accent); }
+
+  .input-row {
+    display: flex; align-items: center; gap: 8px;
+    padding: 10px 16px; border-top: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .prompt-chevron { color: var(--accent); }
+  #message-input { flex: 1; }
+
+  @media (max-width: 640px) {
+    .sidebar { width: 140px; }
+    .auth-card { width: 88vw; }
+  }
+</style>
+</head>
+<body>
+
+  <!-- ============ GİRİŞ / KAYIT ============ -->
+  <div id="screen-auth" class="screen active">
+    <div class="logo">mamichat</div>
+    <div class="auth-card">
+      <div class="tabs">
+        <div id="tab-login" class="tab active">giriş yap</div>
+        <div id="tab-register" class="tab">kayıt ol</div>
+      </div>
+
+      <div id="pane-login" class="pane active">
+        <label>kullanıcı adı</label>
+        <input type="text" id="login-name" autocomplete="off">
+        <label>şifre</label>
+        <input type="password" id="login-pass">
+        <button id="login-btn" class="primary-btn">giriş yap</button>
+      </div>
+
+      <div id="pane-register" class="pane">
+        <label>kullanıcı adı</label>
+        <input type="text" id="reg-name" autocomplete="off">
+        <label>şifre</label>
+        <input type="password" id="reg-pass">
+        <button id="register-btn" class="primary-btn">kayıt ol</button>
+      </div>
+
+      <div id="auth-msg"></div>
+    </div>
+  </div>
+
+  <!-- ============ SOHBET ============ -->
+  <div id="screen-chat" class="screen">
+    <div class="chat-header">
+      <div class="logo">mamichat</div>
+      <div><span id="me-label"></span> &nbsp; <button id="logout-btn">çıkış</button></div>
+    </div>
+
+    <div class="chat-body">
+      <div class="sidebar">
+        <div class="sidebar-row">
+          <input type="text" id="new-contact" placeholder="kullanıcı adı...">
+          <button id="start-chat-btn">aç</button>
+        </div>
+        <div id="chat-side-msg"></div>
+        <div id="contact-list"></div>
+      </div>
+
+      <div class="chat-main">
+        <div class="chat-main-header">konuşuyorsun: <span id="chat-partner">— kimseyle —</span></div>
+        <div id="messages"></div>
+        <div class="input-row">
+          <span class="prompt-chevron">&gt;</span>
+          <input type="text" id="message-input" placeholder="mesaj yaz..." disabled>
+          <button id="send-btn" disabled>gönder</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</body>
+</html>
