@@ -1,0 +1,1140 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>mamichat</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="theme-color" content="#14171c">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="mamichat">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js";
+  import {
+    getFirestore, collection, doc, setDoc, getDoc, updateDoc, deleteDoc, deleteField,
+    arrayUnion, arrayRemove, onSnapshot, addDoc, query, where, orderBy, serverTimestamp,
+    increment, runTransaction
+  } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js";
+  import { getMessaging, getToken } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-messaging.js";
+
+  /* =========================================================
+     BURAYI DOLDUR — Firebase Console > Project settings > Your apps
+     ========================================================= */
+  const firebaseConfig = {
+    apiKey: "AIzaSyCxXN9TYHC9sNpD6Qj1rmlvSA1DVssr7xQ",
+    authDomain: "mamichatv2.firebaseapp.com",
+    projectId: "mamichatv2",
+    storageBucket: "mamichatv2.firebasestorage.app",
+    messagingSenderId: "814980978657",
+    appId: "1:814980978657:web:d86c50ccab2627f66be4a0"
+  };
+
+  /* =========================================================
+     BURAYI DOLDUR — cloudinary.com hesabından
+     ========================================================= */
+  const CLOUDINARY_CLOUD_NAME = "fczzeuvn";
+  const CLOUDINARY_UPLOAD_PRESET = "MaMiChat";
+  /* ========================================================= */
+
+  /* =========================================================
+     BURAYI DOLDUR — gerçek push bildirimi için (opsiyonel)
+     ========================================================= */
+  const VAPID_KEY = "BURAYA_VAPID_KEY";
+  const PUSH_WORKER_URL = "BURAYA_WORKER_URL";
+  /* ========================================================= */
+
+  const MAX_GROUP_SIZE = 12;
+  const REACTION_EMOJIS = ["👍", "❤️", "😂", "😮", "😢", "🙏"];
+  const ONLINE_WINDOW_MS = 45000;
+  const TYPING_WINDOW_MS = 3000;
+
+  const app = initializeApp(firebaseConfig);
+  const db = getFirestore(app);
+  let messaging = null;
+  let swRegistration = null;
+
+  if ("serviceWorker" in navigator) {
+    navigator.serviceWorker.register("sw.js").then(reg => {
+      swRegistration = reg;
+      try { messaging = getMessaging(app); } catch (e) {}
+    }).catch(() => {});
+  }
+
+  // ---------- localStorage yardımcıları (try/catch: bazı önizleme ortamlarında engellenebilir) ----------
+  function saveSession(name, passHash) {
+    try { localStorage.setItem("mamichat_session", JSON.stringify({ name, passHash })); } catch (e) {}
+  }
+  function loadSession() {
+    try { return JSON.parse(localStorage.getItem("mamichat_session")); } catch (e) { return null; }
+  }
+  function clearSession() {
+    try { localStorage.removeItem("mamichat_session"); } catch (e) {}
+  }
+  function saveTheme(t) { try { localStorage.setItem("mamichat_theme", t); } catch (e) {} }
+  function loadTheme() { try { return localStorage.getItem("mamichat_theme"); } catch (e) { return null; } }
+
+  // ---------- yardımcılar ----------
+  const $ = (sel) => document.querySelector(sel);
+  const norm = (s) => s.trim().toLowerCase();
+  const convId = (a, b) => [norm(a), norm(b)].sort().join("__");
+  const escapeHtml = (s) => s.replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+  async function sha256(text) {
+    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(text));
+    return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  function fmtTime(ts) {
+    if (!ts) return "--:--:--";
+    const d = ts.toDate ? ts.toDate() : new Date();
+    return d.toLocaleTimeString("tr-TR", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  }
+  function fmtLastSeen(ts) {
+    if (!ts) return "bilinmiyor";
+    const d = ts.toDate ? ts.toDate() : new Date(ts);
+    const diffMin = Math.floor((Date.now() - d.getTime()) / 60000);
+    if (diffMin < 1) return "az önce";
+    if (diffMin < 60) return `${diffMin} dk önce`;
+    const diffH = Math.floor(diffMin / 60);
+    if (diffH < 24) return `${diffH} sa önce`;
+    return d.toLocaleDateString("tr-TR");
+  }
+
+  function attachmentUrl(url) {
+    return url.replace("/upload/", "/upload/fl_attachment/");
+  }
+
+  function highlightMentions(text, members) {
+    let safe = escapeHtml(text);
+    if (members && members.length) {
+      members.forEach(m => {
+        const re = new RegExp("@" + m.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+        safe = safe.replace(re, `<span class="mention">@${m}</span>`);
+      });
+    }
+    return safe;
+  }
+
+  async function getUserDoc(name) {
+    const snap = await getDoc(doc(db, "users", norm(name)));
+    return snap.exists() ? snap.data() : null;
+  }
+
+  // ---------- state ----------
+  let me = null;
+  let activeChat = null; // { type: 'dm'|'group', id, name, members? }
+  let currentMessages = []; // [{id, ...data}]
+  let searchFilter = "";
+  let unsubMessages = null;
+  let unsubContacts = null;
+  let unsubGroups = null;
+  let unsubActiveMeta = null;
+  let unsubActivePresence = null;
+  let myFriends = [];
+  let myGroups = [];
+  let myBlocked = [];
+  let dmUnread = {};        // { normFriendName: count }
+  let dmUnreadUnsubs = {};  // { normFriendName: unsubscribeFn }
+  let typingTimer = null;
+  let presenceHeartbeat = null;
+  let mediaRecorder = null;
+  let recordedChunks = [];
+  let recordingTimer = null;
+
+  function showScreen(id) {
+    document.querySelectorAll(".screen").forEach(s => s.classList.remove("active"));
+    $(id).classList.add("active");
+  }
+  function setAuthMsg(text, isError = true) {
+    const el = $("#auth-msg");
+    el.textContent = text;
+    el.style.color = isError ? "var(--danger)" : "var(--ok)";
+  }
+  function setSideMsg(text, isError = true) {
+    const el = $("#chat-side-msg");
+    el.textContent = text;
+    el.style.color = isError ? "var(--danger)" : "var(--ok)";
+  }
+
+  // ---------- tema ----------
+  function initTheme() {
+    const t = loadTheme();
+    if (t === "light") document.body.classList.add("light");
+    updateThemeBtn();
+  }
+  function toggleTheme() {
+    document.body.classList.toggle("light");
+    saveTheme(document.body.classList.contains("light") ? "light" : "dark");
+    updateThemeBtn();
+  }
+  function updateThemeBtn() {
+    const btn = $("#theme-toggle-btn");
+    if (btn) btn.textContent = document.body.classList.contains("light") ? "🌙" : "☀️";
+  }
+
+  // ---------- kayıt / giriş ----------
+  async function register() {
+    const name = $("#reg-name").value.trim();
+    const pass = $("#reg-pass").value;
+    if (!name || !pass) return setAuthMsg("kullanıcı adı ve şifre boş olamaz.");
+    if (name.includes("__") || name.includes("/") || name.includes(",")) return setAuthMsg("kullanıcı adı '__', ',' veya '/' içeremez.");
+
+    const passHash = await sha256(pass);
+    const userRef = doc(db, "users", norm(name));
+
+    try {
+      await runTransaction(db, async (tx) => {
+        const snap = await tx.get(userRef);
+        if (snap.exists()) throw new Error("taken");
+        tx.set(userRef, { displayName: name, passHash, bio: "", createdAt: serverTimestamp() });
+      });
+    } catch (e) {
+      return setAuthMsg("bu kullanıcı adı zaten alınmış.");
+    }
+
+    await setDoc(doc(db, "contacts", norm(name)), { friends: [], incoming: [], outgoing: [], blocked: [] });
+    setAuthMsg("kayıt tamam. şimdi giriş yapabilirsin.", false);
+    $("#reg-name").value = ""; $("#reg-pass").value = "";
+  }
+
+  async function login() {
+    const name = $("#login-name").value.trim();
+    const pass = $("#login-pass").value;
+    if (!name || !pass) return setAuthMsg("kullanıcı adı ve şifre boş olamaz.");
+
+    const data = await getUserDoc(name);
+    if (!data) return setAuthMsg("böyle bir kullanıcı yok.");
+
+    const passHash = await sha256(pass);
+    if (data.passHash !== passHash) return setAuthMsg("şifre yanlış.");
+
+    me = data.displayName;
+    saveSession(norm(name), passHash);
+    enterChat();
+  }
+
+  async function tryAutoLogin() {
+    const session = loadSession();
+    if (!session) return;
+    const data = await getUserDoc(session.name);
+    if (!data || data.passHash !== session.passHash) { clearSession(); return; }
+    me = data.displayName;
+    enterChat();
+  }
+
+  function logout() {
+    me = null; activeChat = null; myFriends = []; myGroups = []; myBlocked = []; currentMessages = [];
+    if (unsubMessages) unsubMessages();
+    if (unsubContacts) unsubContacts();
+    if (unsubGroups) unsubGroups();
+    if (unsubActiveMeta) unsubActiveMeta();
+    if (unsubActivePresence) unsubActivePresence();
+    if (presenceHeartbeat) clearInterval(presenceHeartbeat);
+    Object.values(dmUnreadUnsubs).forEach(fn => fn());
+    dmUnreadUnsubs = {}; dmUnread = {};
+    clearSession();
+    $("#login-name").value = ""; $("#login-pass").value = "";
+    setAuthMsg("", false);
+    showScreen("#screen-auth");
+  }
+
+  // ---------- giriş sonrası ----------
+  function notify(title, body) {
+    try {
+      if ("Notification" in window && Notification.permission === "granted") {
+        new Notification(title, { body, icon: "icon-192.png" });
+      }
+    } catch (e) {}
+  }
+
+  async function enterChat() {
+    $("#me-label").textContent = me;
+    showScreen("#screen-chat");
+    $(".chat-body").classList.add("show-list");
+    if ("Notification" in window && Notification.permission === "default") {
+      try { await Notification.requestPermission(); } catch (e) {}
+    }
+    registerPushToken();
+    startPresenceHeartbeat();
+    listenContacts();
+    listenGroups();
+  }
+
+  // ---------- varlık (çevrimiçi/son görülme) ----------
+  function startPresenceHeartbeat() {
+    updatePresence();
+    presenceHeartbeat = setInterval(updatePresence, 20000);
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) updatePresence(); });
+  }
+  async function updatePresence() {
+    if (!me) return;
+    try { await setDoc(doc(db, "presence", norm(me)), { lastSeen: serverTimestamp() }, { merge: true }); } catch (e) {}
+  }
+
+  // ---------- push ----------
+  async function registerPushToken() {
+    if (!messaging || !swRegistration) return;
+    if (VAPID_KEY.startsWith("BURAYA")) return;
+    if (Notification.permission !== "granted") return;
+    try {
+      const token = await getToken(messaging, { vapidKey: VAPID_KEY, serviceWorkerRegistration: swRegistration });
+      if (token) await setDoc(doc(db, "fcmTokens", norm(me)), { tokens: arrayUnion(token) }, { merge: true });
+    } catch (e) { console.warn("push token alınamadı:", e); }
+  }
+  async function sendPush(targetNames, title, body) {
+    if (PUSH_WORKER_URL.startsWith("BURAYA")) return;
+    const allTokens = [];
+    for (const name of targetNames) {
+      const snap = await getDoc(doc(db, "fcmTokens", norm(name)));
+      if (snap.exists() && Array.isArray(snap.data().tokens)) allTokens.push(...snap.data().tokens);
+    }
+    if (!allTokens.length) return;
+    try {
+      await fetch(PUSH_WORKER_URL, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ tokens: allTokens, title, body })
+      });
+    } catch (e) { console.warn("push gönderilemedi:", e); }
+  }
+
+  // ---------- arkadaşlar / gruplar dinleme ----------
+  function listenContacts() {
+    if (unsubContacts) unsubContacts();
+    unsubContacts = onSnapshot(doc(db, "contacts", norm(me)), (snap) => {
+      const data = snap.exists() ? snap.data() : { friends: [], incoming: [], outgoing: [], blocked: [] };
+      myFriends = data.friends || [];
+      myBlocked = data.blocked || [];
+      renderRequests(data.incoming || []);
+      renderBlocked(myBlocked);
+      syncFriendUnreadListeners(myFriends);
+      renderFriends(myFriends);
+    });
+  }
+
+  function syncFriendUnreadListeners(friends) {
+    const currentKeys = friends.map(norm);
+    Object.keys(dmUnreadUnsubs).forEach(k => {
+      if (!currentKeys.includes(k)) { dmUnreadUnsubs[k](); delete dmUnreadUnsubs[k]; delete dmUnread[k]; }
+    });
+    friends.forEach(f => {
+      const key = norm(f);
+      if (dmUnreadUnsubs[key]) return;
+      const id = convId(me, f);
+      dmUnreadUnsubs[key] = onSnapshot(doc(db, "chats", id), (snap) => {
+        const data = snap.exists() ? snap.data() : {};
+        const count = (data.unreadCounts && data.unreadCounts[norm(me)]) || 0;
+        const prev = dmUnread[key] || 0;
+        dmUnread[key] = count;
+        const isOpen = activeChat && activeChat.type === "dm" && norm(activeChat.id) === key;
+        if (count > prev && !isOpen) notify(f, "yeni mesaj gönderdi");
+        renderFriends(myFriends);
+      });
+    });
+  }
+
+  function listenGroups() {
+    if (unsubGroups) unsubGroups();
+    const q = query(collection(db, "groups"), where("members", "array-contains", me));
+    let prevCounts = {};
+    unsubGroups = onSnapshot(q, (snap) => {
+      const next = [];
+      snap.forEach(d => next.push({ id: d.id, ...d.data() }));
+      next.forEach(g => {
+        const count = (g.unreadCounts && g.unreadCounts[norm(me)]) || 0;
+        const prev = prevCounts[g.id] || 0;
+        const isOpen = activeChat && activeChat.type === "group" && activeChat.id === g.id;
+        if (count > prev && !isOpen) notify(g.name, "grupta yeni mesaj var");
+        prevCounts[g.id] = count;
+        if (isOpen) activeChat.members = g.members;
+      });
+      myGroups = next;
+      renderGroups(myGroups);
+    });
+  }
+
+  function renderRequests(list) {
+    const box = $("#request-list");
+    box.innerHTML = "";
+    if (list.length === 0) { box.innerHTML = `<div class="empty-hint small">gelen istek yok</div>`; return; }
+    list.forEach(name => {
+      const row = document.createElement("div");
+      row.className = "request-row";
+      row.innerHTML = `<span>${escapeHtml(name)}</span>`;
+      const acceptBtn = document.createElement("button");
+      acceptBtn.textContent = "kabul et";
+      acceptBtn.onclick = () => acceptRequest(name);
+      const rejectBtn = document.createElement("button");
+      rejectBtn.textContent = "reddet";
+      rejectBtn.onclick = () => rejectRequest(name);
+      row.appendChild(acceptBtn); row.appendChild(rejectBtn);
+      box.appendChild(row);
+    });
+  }
+
+  function renderBlocked(list) {
+    const box = $("#blocked-list");
+    if (!list.length) { box.innerHTML = `<div class="empty-hint small">engellenen yok</div>`; return; }
+    box.innerHTML = "";
+    list.forEach(name => {
+      const row = document.createElement("div");
+      row.className = "request-row";
+      row.innerHTML = `<span>${escapeHtml(name)}</span>`;
+      const unblockBtn = document.createElement("button");
+      unblockBtn.textContent = "engeli kaldır";
+      unblockBtn.onclick = () => unblockUser(name);
+      row.appendChild(unblockBtn);
+      box.appendChild(row);
+    });
+  }
+
+  function renderFriends(list) {
+    const box = $("#friend-list");
+    box.innerHTML = "";
+    if (list.length === 0) { box.innerHTML = `<div class="empty-hint small">henüz arkadaşın yok</div>`; return; }
+    list.forEach(name => {
+      const item = document.createElement("div");
+      const isActive = activeChat && activeChat.type === "dm" && norm(activeChat.id) === norm(name);
+      const count = dmUnread[norm(name)] || 0;
+      item.className = "contact" + (isActive ? " active" : "");
+      const nameSpan = document.createElement("span");
+      nameSpan.textContent = name;
+      item.appendChild(nameSpan);
+      const right = document.createElement("span");
+      right.style.display = "flex"; right.style.gap = "4px"; right.style.alignItems = "center";
+      if (count > 0) { const b = document.createElement("span"); b.className = "badge"; b.textContent = count; right.appendChild(b); }
+      const blockBtn = document.createElement("button");
+      blockBtn.className = "tiny-btn"; blockBtn.textContent = "🚫";
+      blockBtn.title = "engelle";
+      blockBtn.onclick = (e) => { e.stopPropagation(); blockUser(name); };
+      right.appendChild(blockBtn);
+      item.appendChild(right);
+      item.onclick = () => openDM(name);
+      box.appendChild(item);
+    });
+  }
+
+  function renderGroups(list) {
+    const box = $("#group-list");
+    box.innerHTML = "";
+    if (list.length === 0) { box.innerHTML = `<div class="empty-hint small">henüz grubun yok</div>`; return; }
+    list.forEach(g => {
+      const item = document.createElement("div");
+      const isActive = activeChat && activeChat.type === "group" && activeChat.id === g.id;
+      const count = (g.unreadCounts && g.unreadCounts[norm(me)]) || 0;
+      item.className = "contact" + (isActive ? " active" : "");
+      item.innerHTML = `<span>${escapeHtml(g.name)} (${g.members.length})</span>` + (count > 0 ? `<span class="badge">${count}</span>` : "");
+      item.onclick = () => openGroup(g);
+      box.appendChild(item);
+    });
+  }
+
+  // ---------- arkadaşlık istekleri ----------
+  async function sendFriendRequest() {
+    const target = $("#new-contact").value.trim();
+    if (!target) return;
+    if (norm(target) === norm(me)) return setSideMsg("kendine istek gönderemezsin.");
+
+    const targetData = await getUserDoc(target);
+    if (!targetData) return setSideMsg(`"${target}" adında kayıtlı kullanıcı yok.`);
+    const realName = targetData.displayName;
+
+    if (myBlocked.some(b => norm(b) === norm(realName))) return setSideMsg("bu kişiyi engellemişsin, önce engeli kaldır.");
+    const theirContacts = await getDoc(doc(db, "contacts", norm(realName)));
+    if (theirContacts.exists() && (theirContacts.data().blocked || []).some(b => norm(b) === norm(me))) {
+      return setSideMsg("bu kullanıcıya istek gönderemezsin.");
+    }
+    if (myFriends.some(f => norm(f) === norm(realName))) return setSideMsg("zaten arkadaşsınız.");
+
+    await updateDoc(doc(db, "contacts", norm(me)), { outgoing: arrayUnion(realName) });
+    await updateDoc(doc(db, "contacts", norm(realName)), { incoming: arrayUnion(me) });
+    $("#new-contact").value = "";
+    setSideMsg("istek gönderildi.", false);
+  }
+
+  async function acceptRequest(fromName) {
+    await updateDoc(doc(db, "contacts", norm(me)), { incoming: arrayRemove(fromName), friends: arrayUnion(fromName) });
+    await updateDoc(doc(db, "contacts", norm(fromName)), { outgoing: arrayRemove(me), friends: arrayUnion(me) });
+    await setDoc(doc(db, "chats", convId(me, fromName)), { unreadCounts: {} }, { merge: true });
+  }
+  async function rejectRequest(fromName) {
+    await updateDoc(doc(db, "contacts", norm(me)), { incoming: arrayRemove(fromName) });
+    await updateDoc(doc(db, "contacts", norm(fromName)), { outgoing: arrayRemove(me) });
+  }
+
+  // ---------- engelleme ----------
+  async function blockUser(name) {
+    if (!confirm(`${name} adlı kullanıcıyı engellemek istediğine emin misin? Arkadaşlıktan çıkarılacak.`)) return;
+    await updateDoc(doc(db, "contacts", norm(me)), {
+      blocked: arrayUnion(name), friends: arrayRemove(name)
+    });
+    await updateDoc(doc(db, "contacts", norm(name)), { friends: arrayRemove(me) }).catch(() => {});
+    if (activeChat && activeChat.type === "dm" && norm(activeChat.id) === norm(name)) closeActiveChat();
+  }
+  async function unblockUser(name) {
+    await updateDoc(doc(db, "contacts", norm(me)), { blocked: arrayRemove(name) });
+  }
+
+  // ---------- grup oluşturma / yönetimi ----------
+  async function createGroup() {
+    const name = prompt("grup adı:");
+    if (!name) return;
+    const raw = prompt(`eklemek istediğin arkadaşların kullanıcı adlarını virgülle yaz (en fazla ${MAX_GROUP_SIZE - 1} kişi, sen otomatik eklenirsin):`);
+    if (!raw) return;
+
+    const requested = [...new Set(raw.split(",").map(s => s.trim()).filter(Boolean))].filter(n => norm(n) !== norm(me));
+    if (requested.length > MAX_GROUP_SIZE - 1) { alert(`en fazla ${MAX_GROUP_SIZE - 1} kişi ekleyebilirsin (sen dahil ${MAX_GROUP_SIZE}).`); return; }
+
+    const resolved = [me];
+    for (const n of requested) {
+      const data = await getUserDoc(n);
+      if (!data) { alert(`"${n}" adında kayıtlı kullanıcı yok, grup oluşturulmadı.`); return; }
+      if (!resolved.some(r => norm(r) === norm(data.displayName))) resolved.push(data.displayName);
+    }
+
+    const unreadCounts = {};
+    resolved.forEach(r => unreadCounts[norm(r)] = 0);
+    await addDoc(collection(db, "groups"), { name, owner: me, members: resolved, unreadCounts, createdAt: serverTimestamp() });
+  }
+
+  async function renameGroup() {
+    if (!activeChat || activeChat.type !== "group") return;
+    if (norm(activeChat.owner) !== norm(me)) return alert("sadece grup sahibi adını değiştirebilir.");
+    const newName = prompt("yeni grup adı:", activeChat.name);
+    if (!newName) return;
+    await updateDoc(doc(db, "groups", activeChat.id), { name: newName });
+  }
+
+  async function removeGroupMember() {
+    if (!activeChat || activeChat.type !== "group") return;
+    if (norm(activeChat.owner) !== norm(me)) return alert("sadece grup sahibi üye çıkarabilir.");
+    const target = prompt("çıkarmak istediğin üyenin kullanıcı adı:");
+    if (!target) return;
+    if (norm(target) === norm(activeChat.owner)) return alert("grup sahibi çıkarılamaz.");
+    const match = activeChat.members.find(m => norm(m) === norm(target));
+    if (!match) return alert("bu kişi grupta değil.");
+    await updateDoc(doc(db, "groups", activeChat.id), {
+      members: arrayRemove(match),
+      [`unreadCounts.${norm(match)}`]: deleteField()
+    });
+  }
+
+  async function changeGroupPhoto(file) {
+    if (!activeChat || activeChat.type !== "group") return;
+    if (norm(activeChat.owner) !== norm(me)) return alert("sadece grup sahibi fotoğraf değiştirebilir.");
+    const url = await uploadToCloudinary(file, "grup fotoğrafı");
+    if (url) await updateDoc(doc(db, "groups", activeChat.id), { photoUrl: url });
+  }
+
+  // ---------- bio / profil ----------
+  async function editBio() {
+    const cur = await getUserDoc(me);
+    const newBio = prompt("durum mesajın:", (cur && cur.bio) || "");
+    if (newBio === null) return;
+    await setDoc(doc(db, "users", norm(me)), { bio: newBio.trim() }, { merge: true });
+  }
+
+  // ---------- güvenlik ----------
+  async function changePassword() {
+    const oldPass = prompt("mevcut şifren:");
+    if (!oldPass) return;
+    const data = await getUserDoc(me);
+    if ((await sha256(oldPass)) !== data.passHash) return alert("mevcut şifre yanlış.");
+    const newPass = prompt("yeni şifren:");
+    if (!newPass) return;
+    const newHash = await sha256(newPass);
+    await updateDoc(doc(db, "users", norm(me)), { passHash: newHash });
+    saveSession(norm(me), newHash);
+    alert("şifre değiştirildi.");
+  }
+
+  async function deleteAccount() {
+    if (!confirm("hesabını silmek istediğine emin misin? bu geri alınamaz.")) return;
+    if (!confirm("son kez soruyorum: gerçekten silinsin mi?")) return;
+    await deleteDoc(doc(db, "users", norm(me))).catch(() => {});
+    await deleteDoc(doc(db, "contacts", norm(me))).catch(() => {});
+    alert("hesabın silindi. not: geçmiş mesajların ve grup üyeliklerin ayrıca temizlenmedi.");
+    logout();
+  }
+
+  // ---------- sohbet açma / kapama ----------
+  function closeActiveChat() {
+    activeChat = null;
+    if (unsubMessages) unsubMessages();
+    if (unsubActiveMeta) unsubActiveMeta();
+    if (unsubActivePresence) unsubActivePresence();
+    currentMessages = [];
+    $("#chat-partner").textContent = "— kimseyle —";
+    $("#chat-sub-info").textContent = "";
+    $("#messages").innerHTML = "";
+    $(".chat-body").classList.add("show-list");
+  }
+
+  function openDM(partner) {
+    if (unsubActiveMeta) unsubActiveMeta();
+    if (unsubActivePresence) unsubActivePresence();
+    activeChat = { type: "dm", id: partner, name: partner };
+    $("#chat-partner").textContent = partner;
+    $("#group-tools").style.display = "none";
+    $(".chat-body").classList.remove("show-list");
+    dmUnread[norm(partner)] = 0;
+    setDoc(doc(db, "chats", convId(me, partner)), { unreadCounts: { [norm(me)]: 0 } }, { merge: true });
+    renderFriends(myFriends); renderGroups(myGroups);
+
+    getUserDoc(partner).then(d => {
+      $("#chat-sub-info").textContent = (d && d.bio) ? d.bio : "";
+    });
+
+    unsubActivePresence = onSnapshot(doc(db, "presence", norm(partner)), (snap) => {
+      const ts = snap.exists() ? snap.data().lastSeen : null;
+      const online = ts && ts.toDate && (Date.now() - ts.toDate().getTime()) < ONLINE_WINDOW_MS;
+      $("#presence-label").textContent = online ? "🟢 çevrimiçi" : (ts ? `son görülme: ${fmtLastSeen(ts)}` : "");
+    });
+
+    const chatDocRef = doc(db, "chats", convId(me, partner));
+    unsubActiveMeta = onSnapshot(chatDocRef, (snap) => {
+      const data = snap.exists() ? snap.data() : {};
+      const t = data.typing && data.typing[norm(partner)];
+      const isTyping = t && t.toDate && (Date.now() - t.toDate().getTime()) < TYPING_WINDOW_MS;
+      $("#typing-label").textContent = isTyping ? `${partner} yazıyor...` : "";
+    });
+
+    subscribeMessages(collection(db, "chats", convId(me, partner), "messages"));
+  }
+
+  function openGroup(g) {
+    if (unsubActiveMeta) unsubActiveMeta();
+    if (unsubActivePresence) unsubActivePresence();
+    activeChat = { type: "group", id: g.id, name: g.name, members: g.members, owner: g.owner };
+    $("#chat-partner").textContent = `${g.name} (${g.members.length})`;
+    $("#chat-sub-info").textContent = g.members.join(", ");
+    $("#presence-label").textContent = "";
+    $("#group-tools").style.display = "flex";
+    $(".chat-body").classList.remove("show-list");
+    updateDoc(doc(db, "groups", g.id), { [`unreadCounts.${norm(me)}`]: 0 }).catch(() => {});
+    renderFriends(myFriends); renderGroups(myGroups);
+
+    const groupRef = doc(db, "groups", g.id);
+    unsubActiveMeta = onSnapshot(groupRef, (snap) => {
+      const data = snap.exists() ? snap.data() : {};
+      const typingMap = data.typing || {};
+      const typers = Object.keys(typingMap)
+        .filter(k => k !== norm(me))
+        .filter(k => typingMap[k] && typingMap[k].toDate && (Date.now() - typingMap[k].toDate().getTime()) < TYPING_WINDOW_MS);
+      $("#typing-label").textContent = typers.length ? `${typers.join(", ")} yazıyor...` : "";
+      if (data.members) { activeChat.members = data.members; activeChat.owner = data.owner; }
+    });
+
+    subscribeMessages(collection(db, "groups", g.id, "messages"));
+  }
+
+  function subscribeMessages(colRef) {
+    $("#message-input").disabled = false;
+    $("#send-btn").disabled = false;
+    $("#file-btn").disabled = false;
+    $("#mic-btn").disabled = false;
+    $("#search-toggle-btn").disabled = false;
+    $("#messages").innerHTML = "";
+    currentMessages = [];
+    if (unsubMessages) unsubMessages();
+    const q = query(colRef, orderBy("createdAt", "asc"));
+    unsubMessages = onSnapshot(q, (snap) => {
+      currentMessages = [];
+      snap.forEach(d => currentMessages.push({ id: d.id, ...d.data() }));
+      renderMessages();
+    });
+  }
+
+  function activeCollection() {
+    if (!activeChat) return null;
+    return activeChat.type === "group"
+      ? collection(db, "groups", activeChat.id, "messages")
+      : collection(db, "chats", convId(me, activeChat.id), "messages");
+  }
+
+  // ---------- mesaj gösterimi ----------
+  function renderMessages() {
+    const box = $("#messages");
+    box.innerHTML = "";
+    const filter = searchFilter.trim().toLowerCase();
+    currentMessages.forEach(msg => {
+      if (filter) {
+        const hay = ((msg.text || "") + " " + (msg.fileName || "")).toLowerCase();
+        if (!hay.includes(filter)) return;
+      }
+      box.appendChild(buildMessageEl(msg));
+    });
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function buildMessageEl(msg) {
+    const row = document.createElement("div");
+    const mine = norm(msg.sender) === norm(me);
+    row.className = "msg" + (mine ? " mine" : "") + " msg-enter";
+
+    let body = "";
+    if (msg.deleted) {
+      body = `<span class="deleted-note">(mesaj silindi)</span>`;
+    } else if (msg.type === "file") {
+      if (msg.resourceType === "image") {
+        body = `<a href="${msg.url}" target="_blank"><img class="msg-media" src="${msg.url}"></a>
+                <a class="dl-link" href="${attachmentUrl(msg.url)}" download>⬇ indir (${escapeHtml(msg.fileName)})</a>`;
+      } else if (msg.resourceType === "video") {
+        body = `<video class="msg-media" src="${msg.url}" controls></video>
+                <a class="dl-link" href="${attachmentUrl(msg.url)}" download>⬇ indir (${escapeHtml(msg.fileName)})</a>`;
+      } else if (msg.resourceType === "audio") {
+        body = `<audio src="${msg.url}" controls></audio>
+                <a class="dl-link" href="${attachmentUrl(msg.url)}" download>⬇ indir</a>`;
+      } else {
+        body = `<a class="file-chip" href="${attachmentUrl(msg.url)}" download>📎 ${escapeHtml(msg.fileName)} — indir</a>`;
+      }
+    } else {
+      const members = activeChat.type === "group" ? activeChat.members : null;
+      body = `<span class="msg-text-content">${highlightMentions(msg.text, members)}</span>` + (msg.edited ? ` <span class="edited-note">(düzenlendi)</span>` : "");
+    }
+
+    const reactionsHtml = renderReactions(msg);
+
+    let actionsHtml = `<span class="msg-action" data-action="react">🙂</span>`;
+    if (mine && !msg.deleted) {
+      if (msg.type === "text") actionsHtml += ` <span class="msg-action" data-action="edit">✎</span>`;
+      actionsHtml += ` <span class="msg-action" data-action="delete">🗑</span>`;
+    }
+
+    row.innerHTML = `
+      <span class="msg-time">[${fmtTime(msg.createdAt)}]</span> <span class="msg-sender">${escapeHtml(msg.sender)}:</span>
+      <div class="msg-body">${body}</div>
+      <div class="msg-footer">${reactionsHtml}<span class="msg-actions">${actionsHtml}</span></div>
+      <div class="reaction-picker" hidden>${REACTION_EMOJIS.map(e => `<span class="reaction-opt">${e}</span>`).join("")}</div>
+    `;
+
+    const editEl = row.querySelector('[data-action="edit"]');
+    if (editEl) editEl.addEventListener("click", () => editMessage(msg));
+    const delEl = row.querySelector('[data-action="delete"]');
+    if (delEl) delEl.addEventListener("click", () => deleteMessage(msg));
+    const picker = row.querySelector(".reaction-picker");
+    row.querySelector('[data-action="react"]').addEventListener("click", () => { picker.hidden = !picker.hidden; });
+    picker.querySelectorAll(".reaction-opt").forEach(opt => {
+      opt.addEventListener("click", () => { toggleReaction(msg, opt.textContent); picker.hidden = true; });
+    });
+
+    return row;
+  }
+
+  function renderReactions(msg) {
+    if (!msg.reactions) return "";
+    const parts = [];
+    Object.keys(msg.reactions).forEach(emoji => {
+      const users = msg.reactions[emoji] || [];
+      if (users.length) parts.push(`<span class="reaction-chip">${emoji} ${users.length}</span>`);
+    });
+    return parts.join(" ");
+  }
+
+  async function toggleReaction(msg, emoji) {
+    const ref = doc(activeCollection(), msg.id);
+    const already = (msg.reactions && msg.reactions[emoji] || []).some(u => norm(u) === norm(me));
+    await updateDoc(ref, { [`reactions.${emoji}`]: already ? arrayRemove(me) : arrayUnion(me) });
+  }
+
+  async function editMessage(msg) {
+    const newText = prompt("mesajı düzenle:", msg.text);
+    if (newText === null || !newText.trim()) return;
+    await updateDoc(doc(activeCollection(), msg.id), { text: newText.trim(), edited: true });
+  }
+
+  async function deleteMessage(msg) {
+    if (!confirm("bu mesajı silmek istiyor musun?")) return;
+    await updateDoc(doc(activeCollection(), msg.id), { deleted: true, text: "" });
+  }
+
+  // ---------- yazıyor göstergesi ----------
+  function handleTypingInput() {
+    if (!activeChat) return;
+    clearTimeout(typingTimer);
+    typingTimer = setTimeout(() => sendTypingPing(), 200);
+  }
+  async function sendTypingPing() {
+    if (!activeChat) return;
+    const ref = activeChat.type === "group" ? doc(db, "groups", activeChat.id) : doc(db, "chats", convId(me, activeChat.id));
+    await setDoc(ref, { typing: { [norm(me)]: serverTimestamp() } }, { merge: true }).catch(() => {});
+  }
+
+  // ---------- gönderme ----------
+  async function bumpUnread() {
+    if (activeChat.type === "group") {
+      const updates = {};
+      activeChat.members.forEach(m => { if (norm(m) !== norm(me)) updates[`unreadCounts.${norm(m)}`] = increment(1); });
+      if (Object.keys(updates).length) await updateDoc(doc(db, "groups", activeChat.id), updates).catch(() => {});
+    } else {
+      const id = convId(me, activeChat.id);
+      await setDoc(doc(db, "chats", id), { unreadCounts: { [norm(activeChat.id)]: increment(1) } }, { merge: true });
+    }
+  }
+
+  function otherMembers() {
+    if (activeChat.type === "group") return activeChat.members.filter(m => norm(m) !== norm(me));
+    return [activeChat.id];
+  }
+
+  async function sendMessage() {
+    const input = $("#message-input");
+    const text = input.value.trim();
+    if (!text || !activeChat) return;
+    input.value = "";
+    await addDoc(activeCollection(), { sender: me, type: "text", text, createdAt: serverTimestamp() });
+    bumpUnread();
+    sendPush(otherMembers(), me, text);
+  }
+
+  // ---------- dosya / cloudinary ----------
+  async function uploadToCloudinary(file, label) {
+    if (CLOUDINARY_CLOUD_NAME.startsWith("BURAYA")) { setSideMsg("önce Cloudinary bilgilerini dosyaya girmen lazım."); return null; }
+    setSideMsg(`yükleniyor: ${label}...`, false);
+    const form = new FormData();
+    form.append("file", file);
+    form.append("upload_preset", CLOUDINARY_UPLOAD_PRESET);
+    try {
+      const res = await fetch(`https://api.cloudinary.com/v1_1/${CLOUDINARY_CLOUD_NAME}/auto/upload`, { method: "POST", body: form });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error?.message || "yükleme hatası");
+      setSideMsg("");
+      return data;
+    } catch (err) {
+      setSideMsg("yükleme başarısız: " + err.message);
+      return null;
+    }
+  }
+
+  async function uploadFile(file) {
+    if (!activeChat) return;
+    const data = await uploadToCloudinary(file, file.name);
+    if (!data) return;
+    const fileName = data.original_filename + (data.format ? "." + data.format : "");
+    await addDoc(activeCollection(), {
+      sender: me, type: "file", resourceType: data.resource_type,
+      url: data.secure_url, fileName, createdAt: serverTimestamp()
+    });
+    bumpUnread();
+    sendPush(otherMembers(), me, "bir dosya gönderdi: " + fileName);
+  }
+
+  async function uploadVoice(blob) {
+    if (!activeChat) return;
+    const file = new File([blob], "ses-mesaji.webm", { type: "audio/webm" });
+    const data = await uploadToCloudinary(file, "ses mesajı");
+    if (!data) return;
+    await addDoc(activeCollection(), {
+      sender: me, type: "file", resourceType: "audio",
+      url: data.secure_url, fileName: "ses-mesaji.webm", createdAt: serverTimestamp()
+    });
+    bumpUnread();
+    sendPush(otherMembers(), me, "sesli mesaj gönderdi");
+  }
+
+  // ---------- ses kaydı ----------
+  async function toggleRecording() {
+    if (mediaRecorder && mediaRecorder.state === "recording") {
+      mediaRecorder.stop();
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      recordedChunks = [];
+      mediaRecorder = new MediaRecorder(stream);
+      mediaRecorder.ondataavailable = (e) => { if (e.data.size > 0) recordedChunks.push(e.data); };
+      mediaRecorder.onstop = () => {
+        stream.getTracks().forEach(t => t.stop());
+        clearInterval(recordingTimer);
+        $("#mic-btn").textContent = "🎤";
+        $("#mic-btn").classList.remove("recording");
+        const blob = new Blob(recordedChunks, { type: "audio/webm" });
+        if (blob.size > 500) uploadVoice(blob);
+      };
+      mediaRecorder.start();
+      $("#mic-btn").textContent = "⏹";
+      $("#mic-btn").classList.add("recording");
+      let secs = 0;
+      recordingTimer = setInterval(() => { secs++; setSideMsg(`kaydediliyor... ${secs}sn`, false); }, 1000);
+    } catch (e) {
+      setSideMsg("mikrofona erişilemedi: " + e.message);
+    }
+  }
+
+  // ---------- olaylar ----------
+  window.addEventListener("DOMContentLoaded", () => {
+    initTheme();
+
+    $("#tab-login").onclick = () => { $("#pane-login").classList.add("active"); $("#pane-register").classList.remove("active"); $("#tab-login").classList.add("active"); $("#tab-register").classList.remove("active"); setAuthMsg("", false); };
+    $("#tab-register").onclick = () => { $("#pane-register").classList.add("active"); $("#pane-login").classList.remove("active"); $("#tab-register").classList.add("active"); $("#tab-login").classList.remove("active"); setAuthMsg("", false); };
+
+    $("#login-btn").onclick = login;
+    $("#register-btn").onclick = register;
+    $("#logout-btn").onclick = logout;
+    $("#start-chat-btn").onclick = sendFriendRequest;
+    $("#create-group-btn").onclick = createGroup;
+    $("#send-btn").onclick = sendMessage;
+    $("#file-btn").onclick = () => $("#file-input").click();
+    $("#mic-btn").onclick = toggleRecording;
+    $("#back-to-list-btn").onclick = closeActiveChat;
+    $("#theme-toggle-btn").onclick = toggleTheme;
+    $("#edit-bio-btn").onclick = editBio;
+    $("#change-pass-btn").onclick = changePassword;
+    $("#delete-account-btn").onclick = deleteAccount;
+    $("#rename-group-btn").onclick = renameGroup;
+    $("#remove-member-btn").onclick = removeGroupMember;
+    $("#group-photo-btn").onclick = () => $("#group-photo-input").click();
+    $("#group-photo-input").onchange = (e) => { if (e.target.files[0]) changeGroupPhoto(e.target.files[0]); e.target.value = ""; };
+    $("#file-input").onchange = (e) => { if (e.target.files[0]) uploadFile(e.target.files[0]); e.target.value = ""; };
+
+    $("#search-toggle-btn").onclick = () => {
+      const box = $("#search-box");
+      box.hidden = !box.hidden;
+      if (!box.hidden) $("#search-input").focus();
+      else { $("#search-input").value = ""; searchFilter = ""; renderMessages(); }
+    };
+    $("#search-input").addEventListener("input", (e) => { searchFilter = e.target.value; renderMessages(); });
+
+    $("#login-pass").addEventListener("keydown", e => { if (e.key === "Enter") login(); });
+    $("#reg-pass").addEventListener("keydown", e => { if (e.key === "Enter") register(); });
+    $("#new-contact").addEventListener("keydown", e => { if (e.key === "Enter") sendFriendRequest(); });
+    $("#message-input").addEventListener("keydown", e => { if (e.key === "Enter") sendMessage(); });
+    $("#message-input").addEventListener("input", handleTypingInput);
+
+    tryAutoLogin();
+  });
+</script>
+<style>
+  :root {
+    --bg: #14171c; --panel: #1a1e25; --panel-2: #1f242c; --border: #2a2f38;
+    --text: #d8dee9; --text-dim: #6b7280; --accent: #e8a33d; --ok: #7fb069; --danger: #e0645a;
+  }
+  body.light {
+    --bg: #f4f2ec; --panel: #ffffff; --panel-2: #ece8dd; --border: #ddd7c8;
+    --text: #2b2a26; --text-dim: #837c6c; --accent: #b5651d; --ok: #4f8a52; --danger: #b23b30;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; background: var(--bg); color: var(--text); font-family: 'JetBrains Mono', monospace; font-size: 14px; }
+  .screen { display: none; height: 100%; }
+  .screen.active { display: flex; }
+
+  #screen-auth { align-items: center; justify-content: center; flex-direction: column; gap: 24px; }
+  .logo { font-size: 22px; font-weight: 700; letter-spacing: -0.5px; }
+  .logo::after { content: "█"; color: var(--accent); animation: blink 1s steps(1) infinite; margin-left: 2px; }
+  @keyframes blink { 50% { opacity: 0; } }
+
+  .auth-card { width: 320px; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 20px; }
+  .tabs { display: flex; margin-bottom: 16px; border-bottom: 1px solid var(--border); }
+  .tab { flex: 1; text-align: center; padding: 8px 0; color: var(--text-dim); cursor: pointer; border-bottom: 2px solid transparent; }
+  .tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+  .pane { display: none; flex-direction: column; gap: 10px; }
+  .pane.active { display: flex; }
+
+  label { color: var(--text-dim); font-size: 12px; }
+  input[type=text], input[type=password] {
+    width: 100%; background: var(--bg); border: 1px solid var(--border); color: var(--text);
+    font-family: inherit; font-size: 14px; padding: 8px 10px; border-radius: 4px; outline: none;
+    direction: ltr; unicode-bidi: plaintext; text-align: left;
+  }
+  input[type=text]:focus, input[type=password]:focus { border-color: var(--accent); }
+
+  button {
+    font-family: inherit; font-size: 13px; cursor: pointer; border-radius: 4px;
+    border: 1px solid var(--border); background: var(--panel-2); color: var(--text); padding: 8px 12px;
+  }
+  button:hover { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: 0.4; cursor: default; }
+  button:disabled:hover { border-color: var(--border); color: var(--text); }
+  .primary-btn { background: var(--accent); color: #1a1206; border-color: var(--accent); font-weight: 600; }
+  .primary-btn:hover { opacity: 0.9; color: #1a1206; }
+  .tiny-btn { padding: 2px 6px; font-size: 11px; }
+  .mic-btn.recording { background: var(--danger); color: #fff; border-color: var(--danger); }
+
+  #auth-msg { min-height: 16px; font-size: 12px; }
+
+  #screen-chat { flex-direction: column; }
+  .chat-header { display: flex; align-items: center; justify-content: space-between; padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  .chat-header .logo { font-size: 15px; }
+  .header-right { display: flex; align-items: center; gap: 8px; }
+  #me-label { color: var(--accent); }
+
+  .chat-body { flex: 1; display: flex; min-height: 0; }
+
+  .sidebar { width: 240px; border-right: 1px solid var(--border); background: var(--panel); display: flex; flex-direction: column; padding: 12px; gap: 4px; overflow-y: auto; }
+  .sidebar-row { display: flex; gap: 6px; }
+  .sidebar-row input { flex: 1; }
+  #chat-side-msg { font-size: 11px; min-height: 14px; }
+  .section-title { font-size: 11px; color: var(--text-dim); margin-top: 14px; margin-bottom: 4px; text-transform: lowercase; display: flex; justify-content: space-between; align-items: center; }
+  .contact { padding: 8px; border-radius: 4px; cursor: pointer; color: var(--text-dim); border: 1px solid transparent; font-size: 13px; display: flex; justify-content: space-between; align-items: center; }
+  .badge { background: var(--accent); color: #1a1206; font-size: 10px; font-weight: 700; border-radius: 999px; min-width: 16px; height: 16px; display: inline-flex; align-items: center; justify-content: center; padding: 0 4px; }
+  .contact:hover { color: var(--text); }
+  .contact.active { color: var(--accent); border-color: var(--border); background: var(--panel-2); }
+  .empty-hint { color: var(--text-dim); font-size: 12px; line-height: 1.6; padding: 8px 4px; }
+  .empty-hint.small { padding: 4px; font-size: 11px; }
+
+  .request-row { display: flex; align-items: center; gap: 4px; font-size: 12px; padding: 6px 4px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+  .request-row button { padding: 3px 6px; font-size: 11px; }
+
+  .chat-main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  .chat-main-header { padding: 8px 16px; border-bottom: 1px solid var(--border); color: var(--text-dim); font-size: 13px; }
+  .chat-main-header-top { display: flex; align-items: center; justify-content: space-between; }
+  .chat-main-header span.accent { color: var(--accent); }
+  #chat-sub-info { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+  #presence-label, #typing-label { font-size: 11px; color: var(--ok); margin-top: 2px; }
+  #group-tools { display: none; gap: 4px; margin-top: 4px; }
+  #group-tools button { font-size: 11px; padding: 3px 6px; }
+
+  #search-box { display: flex; padding: 6px 16px; border-bottom: 1px solid var(--border); background: var(--panel); }
+  #search-box input { flex: 1; }
+
+  #messages { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 10px; }
+  .msg { font-size: 13px; line-height: 1.5; word-break: break-word; position: relative; }
+  .msg-time { color: var(--text-dim); }
+  .msg-sender { color: var(--text-dim); }
+  .msg.mine .msg-sender { color: var(--accent); }
+  .msg-body { margin-top: 2px; }
+  .msg-media { max-width: 260px; max-height: 260px; display: block; border-radius: 4px; border: 1px solid var(--border); margin: 4px 0; }
+  .dl-link, .file-chip { color: var(--accent); text-decoration: none; font-size: 12px; }
+  .dl-link:hover, .file-chip:hover { text-decoration: underline; }
+  .file-chip { display: inline-block; padding: 6px 10px; border: 1px solid var(--border); border-radius: 4px; background: var(--panel-2); }
+  .deleted-note, .edited-note { color: var(--text-dim); font-style: italic; font-size: 12px; }
+  .mention { color: var(--accent); font-weight: 600; }
+
+  .msg-footer { display: flex; justify-content: space-between; align-items: center; margin-top: 2px; min-height: 16px; }
+  .reaction-chip { font-size: 11px; background: var(--panel-2); border: 1px solid var(--border); border-radius: 999px; padding: 1px 6px; margin-right: 3px; }
+  .msg-actions { opacity: 0.5; font-size: 12px; }
+  .msg-actions:hover { opacity: 1; }
+  .msg-action { cursor: pointer; margin-left: 6px; }
+  .reaction-picker { display: flex; gap: 4px; margin-top: 4px; }
+  .reaction-picker[hidden] { display: none; }
+  .reaction-opt { cursor: pointer; font-size: 16px; }
+
+  @keyframes msgEnter { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: translateY(0); } }
+  .msg-enter { animation: msgEnter 0.18s ease-out; }
+
+  .input-row { display: flex; align-items: center; gap: 8px; padding: 10px 16px; border-top: 1px solid var(--border); background: var(--panel); }
+  .prompt-chevron { color: var(--accent); }
+  #message-input { flex: 1; }
+
+  .back-btn { display: none; }
+
+  @media (max-width: 480px) {
+    .sidebar { width: 100%; }
+    .auth-card { width: 88vw; }
+    .msg-media { max-width: 70vw; max-height: 220px; }
+
+    .chat-body.show-list .chat-main { display: none; }
+    .chat-body:not(.show-list) .sidebar { display: none; }
+    .back-btn { display: inline-block; margin-right: 8px; }
+
+    input[type=text], input[type=password], button { font-size: 15px; padding: 10px 12px; }
+    .contact, .request-row { font-size: 14px; padding: 12px 8px; }
+    .chat-header .logo, .logo { font-size: 18px; }
+  }
+</style>
+</head>
+<body>
+
+  <div id="screen-auth" class="screen active">
+    <div class="logo">mamichat</div>
+    <div class="auth-card">
+      <div class="tabs">
+        <div id="tab-login" class="tab active">giriş yap</div>
+        <div id="tab-register" class="tab">kayıt ol</div>
+      </div>
+
+      <div id="pane-login" class="pane active">
+        <label>kullanıcı adı</label>
+        <input type="text" id="login-name" autocomplete="off" dir="ltr">
+        <label>şifre</label>
+        <input type="password" id="login-pass" dir="ltr">
+        <button id="login-btn" class="primary-btn">giriş yap</button>
+      </div>
+
+      <div id="pane-register" class="pane">
+        <label>kullanıcı adı</label>
+        <input type="text" id="reg-name" autocomplete="off" dir="ltr">
+        <label>şifre</label>
+        <input type="password" id="reg-pass" dir="ltr">
+        <button id="register-btn" class="primary-btn">kayıt ol</button>
+      </div>
+
+      <div id="auth-msg"></div>
+    </div>
+  </div>
+
+  <div id="screen-chat" class="screen">
+    <div class="chat-header">
+      <div class="logo">mamichat</div>
+      <div class="header-right">
+        <button id="theme-toggle-btn" title="tema">☀️</button>
+        <span id="me-label"></span>
+        <button id="logout-btn">çıkış</button>
+      </div>
+    </div>
+
+    <div class="chat-body">
+      <div class="sidebar">
+        <div class="sidebar-row">
+          <input type="text" id="new-contact" placeholder="kullanıcı adı..." dir="ltr">
+          <button id="start-chat-btn">istek gönder</button>
+        </div>
+        <div id="chat-side-msg"></div>
+
+        <div class="section-title">gelen istekler</div>
+        <div id="request-list"></div>
+
+        <div class="section-title">arkadaşların</div>
+        <div id="friend-list"></div>
+
+        <div class="section-title">gruplar &nbsp; <button id="create-group-btn">+ grup</button></div>
+        <div id="group-list"></div>
+
+        <div class="section-title">engellenenler</div>
+        <div id="blocked-list"></div>
+
+        <div class="section-title">profil &amp; güvenlik</div>
+        <button id="edit-bio-btn" style="margin-bottom:4px;">durum mesajı</button>
+        <button id="change-pass-btn" style="margin-bottom:4px;">şifre değiştir</button>
+        <button id="delete-account-btn">hesabı sil</button>
+      </div>
+
+      <div class="chat-main">
+        <div class="chat-main-header">
+          <div class="chat-main-header-top">
+            <div>
+              <button id="back-to-list-btn" class="back-btn">&larr; kişiler</button>
+              konuşuyorsun: <span class="accent" id="chat-partner">— kimseyle —</span>
+            </div>
+            <button id="search-toggle-btn" disabled title="mesajlarda ara">🔍</button>
+          </div>
+          <div id="chat-sub-info"></div>
+          <div id="presence-label"></div>
+          <div id="typing-label"></div>
+          <div id="group-tools">
+            <button id="rename-group-btn">✎ ad değiştir</button>
+            <button id="group-photo-btn">📷 fotoğraf</button>
+            <input type="file" id="group-photo-input" accept="image/*" hidden>
+            <button id="remove-member-btn">üye çıkar</button>
+          </div>
+        </div>
+        <div id="search-box" hidden><input type="text" id="search-input" placeholder="mesajlarda ara..." dir="ltr"></div>
+        <div id="messages"></div>
+        <div class="input-row">
+          <button id="file-btn" disabled>📎</button>
+          <input type="file" id="file-input" hidden>
+          <button id="mic-btn" class="mic-btn" disabled>🎤</button>
+          <span class="prompt-chevron">&gt;</span>
+          <input type="text" id="message-input" placeholder="mesaj yaz..." disabled dir="ltr">
+          <button id="send-btn" disabled>gönder</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</body>
+</html>
